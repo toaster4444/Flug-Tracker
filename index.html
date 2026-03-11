@@ -475,7 +475,8 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 // ═══════════════════════════════════
 // STATE
 // ═══════════════════════════════════
-const OPENSKY = url => `https://corsproxy.io/?url=${encodeURIComponent('https://opensky-network.org/api' + url)}`;
+// adsb.lol — kostenlos, kein API-Key, CORS-freundlich, direkt im Browser nutzbar
+const ADSBLOL = 'https://api.adsb.lol/v2';
 
 let CFG = {apiKey:'', lat:48.7758, lon:9.1829, dir:220, spread:25, range:15, altMin:0, altMax:15000, altMetric:false, spdKmh:false};
 let demoMode = true;
@@ -1077,13 +1078,11 @@ async function fetchRouteForFlight(icao24, callsign){
   if(routeCache[icao24]) return routeCache[icao24];
   if(!callsign || callsign.length < 3) return null;
   try{
-    // Via Proxy (bevorzugt, kein CORS-Problem)
-    const base = OPENSKY;
     let route = null;
-
-    // 1) Route via Callsign
+    // OpenSky Routes API via corsproxy (nur für Routen, nicht für Positionen)
     try {
-      const r = await fetch(OPENSKY(`/routes?callsign=${encodeURIComponent(callsign.trim())}`));
+      const url = `https://corsproxy.io/?url=${encodeURIComponent('https://opensky-network.org/api/routes?callsign='+callsign.trim())}`;
+      const r = await fetch(url);
       if(r.ok){
         const d = await r.json();
         if(d && d.route && d.route.length >= 2){
@@ -1091,23 +1090,6 @@ async function fetchRouteForFlight(icao24, callsign){
         }
       }
     } catch(e){}
-
-    // 2) Fallback: Flughistorie via ICAO24
-    if(!route){
-      try {
-      const r2 = await fetch(OPENSKY(`/flights/aircraft?icao24=${icao24}&begin=${Math.floor(Date.now()/1000)-10800}&end=${Math.floor(Date.now()/1000)}`));
-        if(r2.ok){
-          const arr = await r2.json();
-          if(arr && arr.length){
-            const latest = arr[arr.length-1];
-            route = {
-              origin: airportCity(latest.estDepartureAirport),
-              dest:   airportCity(latest.estArrivalAirport),
-            };
-          }
-        }
-      } catch(e){}
-    }
 
     if(route){ routeCache[icao24] = route; }
     return route;
@@ -1121,7 +1103,7 @@ function onDemoToggle(){
   demoMode = document.getElementById('cfgDemoMode').checked;
   document.getElementById('demoModeLabel').textContent = demoMode ? 'DEMO-MODUS AKTIV' : 'ECHTDATEN AKTIV';
   document.getElementById('liveLbl').textContent  = demoMode ? 'DEMO' : 'LIVE';
-  document.getElementById('bfRight').textContent  = demoMode ? 'DEMO-MODUS' : 'OPENSKY NETWORK';
+  document.getElementById('bfRight').textContent  = demoMode ? 'DEMO-MODUS' : 'ADSB.LOL';
   if(updateTimer) clearInterval(updateTimer);
   if(demoMode){
     allFlights=genDemo(); filterRender();
@@ -1137,24 +1119,23 @@ async function fetchFlights(){
   const status = document.getElementById('openskyStatus');
   status.textContent='● ABRUFEN...'; status.style.color='#888';
   try{
-    const pad = Math.max(0.5, CFG.range/80);
-    const url = OPENSKY(`/states/all?lamin=${CFG.lat-pad}&lomin=${CFG.lon-pad}&lamax=${CFG.lat+pad}&lomax=${CFG.lon+pad}`);
+    // adsb.lol: /v2/lat/{lat}/lon/{lon}/dist/{nm}
+    // dist in nautical miles (1 km ≈ 0.54 nm)
+    const distNm = Math.round(CFG.range * 0.54 * 1.5);
+    const url = `${ADSBLOL}/lat/${CFG.lat}/lon/${CFG.lon}/dist/${distNm}`;
     const res = await fetch(url);
     if(!res.ok) throw new Error('HTTP '+res.status);
     const data = await res.json();
-    const states = data.states || [];
+    const aircraft = data.ac || [];
 
-    // OpenSky state vector fields:
-    // [0]icao24 [1]callsign [2]origin_country [3]time_position [4]last_contact
-    // [5]lon [6]lat [7]baro_alt [8]on_ground [9]velocity [10]heading [11]vert_rate
-    // [12]sensors [13]geo_alt [14]squawk [15]spi [16]position_source
-    allFlights = states
-      .filter(s => s && s[5] && s[6] && !s[8]) // has position, not on ground
-      .map(s => {
-        const icao24   = s[0] || '';
-        const callsign = (s[1]||'').trim().toUpperCase() || icao24.toUpperCase();
-        const alt      = (s[7]||s[13]||0) * 3.28084; // metres → feet
-        const gs       = (s[9]||0) * 1.94384; // m/s → knots
+    // adsb.lol fields: hex, flight, lat, lon, alt_baro, gs, track, on_ground, r (reg), t (type)
+    allFlights = aircraft
+      .filter(a => a && a.lat && a.lon && a.alt_baro !== 'ground' && !a.on_ground)
+      .map(a => {
+        const icao24   = (a.hex || '').toLowerCase();
+        const callsign = (a.flight || '').trim().toUpperCase() || icao24.toUpperCase();
+        const alt_ft   = typeof a.alt_baro === 'number' ? a.alt_baro : (a.alt_geom || 0);
+        const gs       = a.gs || 0;
         const route    = routeCache[icao24] || null;
         return {
           id:       icao24,
@@ -1162,13 +1143,13 @@ async function fetchFlights(){
           icao24:   icao24,
           origin:   route ? route.origin : '---',
           dest:     route ? route.dest   : '---',
-          lat:      s[6], lon: s[5],
-          alt:      alt,
+          lat:      a.lat, lon: a.lon,
+          alt:      alt_ft,
           gs:       gs,
-          heading:  s[10]||0,
-          type:     guessType(callsign),
+          heading:  a.track || 0,
+          type:     a.t || guessType(callsign),
           operator: airlineFromCallsign(callsign),
-          dist:     haversine(CFG.lat, CFG.lon, s[6], s[5]),
+          dist:     haversine(CFG.lat, CFG.lon, a.lat, a.lon),
         };
       });
 
