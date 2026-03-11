@@ -476,6 +476,1400 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 // STATE
 // ═══════════════════════════════════
 // Vercel Serverless Functions — funktioniert auf jedem Gerät ohne eigenen Server
+const PROXY_URL = '/api';
+
+let CFG = {apiKey:'', lat:48.7758, lon:9.1829, dir:220, spread:25, range:15, altMin:0, altMax:15000, altMetric:false, spdKmh:false};
+let demoMode = true;
+let sMap=null, mMap=null, sHomeMarker=null, mHomeMarker=null;
+let sConeLayer=null, mConeLayer=null;
+let sPlanes=[], mPlanes=[];
+let sMapInited=false, mMapInited=false;
+let allFlights=[], selFlight=null;
+let drawActive=false, drawOrigin=null, drawSaved={dir:220,spread:25,range:15};
+let updateTimer=null;
+
+// ═══════════════════════════════════
+// CLOCK
+// ═══════════════════════════════════
+setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString('de-DE'),1000);
+
+// ═══════════════════════════════════
+// TABS
+// ═══════════════════════════════════
+function switchTab(tab){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('page-'+tab).classList.add('active');
+  document.getElementById('tab-'+tab).classList.add('active');
+  if(tab==='settings'){
+    if(!sMapInited) initSettingsMap();
+    else setTimeout(()=>{sMap.invalidateSize();drawCone(sMap,'s');},50);
+    syncInputs();
+  }
+  if(tab==='main' && mMapInited) setTimeout(()=>mMap.invalidateSize(),50);
+}
+
+// ═══════════════════════════════════
+// MAIN MAP TOGGLE
+// ═══════════════════════════════════
+function toggleMainMap(){
+  const on = document.getElementById('mainMapToggle').checked;
+  const panel = document.getElementById('mainMapPanel');
+  if(on){
+    panel.classList.add('show');
+    if(!mMapInited) initMainMap();
+    else setTimeout(()=>{mMap.invalidateSize();drawCone(mMap,'m');updatePlanes(mMap,'m');},80);
+  } else {
+    panel.classList.remove('show');
+  }
+}
+
+// ═══════════════════════════════════
+// SETTINGS MAP INIT
+// ═══════════════════════════════════
+function initSettingsMap(){
+  sMap = L.map('settingsMap',{zoomControl:true,attributionControl:false});
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(sMap);
+  sMap.setView([CFG.lat,CFG.lon],11);
+  placeHomeMarker(sMap,'s');
+  drawCone(sMap,'s');
+  setupScrollOnMap('settingsMap');
+  sMap.on('mousedown',onSMapDown);
+  sMap.on('mousemove',onSMapMove);
+  sMap.on('mouseup',  onSMapUp);
+  sMapInited=true;
+  setTimeout(()=>sMap.invalidateSize(),100);
+}
+
+// ═══════════════════════════════════
+// MAIN MAP INIT
+// ═══════════════════════════════════
+function initMainMap(){
+  mMap = L.map('mainMap',{zoomControl:false,attributionControl:false,dragging:false,scrollWheelZoom:false,doubleClickZoom:false,touchZoom:false});
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(mMap);
+  mMap.setView([CFG.lat,CFG.lon],10);
+  placeHomeMarker(mMap,'m');
+  drawCone(mMap,'m');
+  updatePlanes(mMap,'m');
+  mMapInited=true;
+  setTimeout(()=>mMap.invalidateSize(),100);
+}
+
+// ═══════════════════════════════════
+// MARKERS + CONE
+// ═══════════════════════════════════
+function placeHomeMarker(map,id){
+  if(id==='s'&&sHomeMarker){sHomeMarker.remove();}
+  if(id==='m'&&mHomeMarker){mHomeMarker.remove();}
+  const icon=L.divIcon({html:`<div style="width:11px;height:11px;background:#ffb300;border-radius:50%;border:2px solid #000;box-shadow:0 0 10px rgba(255,179,0,.9)"></div>`,iconSize:[11,11],iconAnchor:[5,5],className:''});
+  const mk=L.marker([CFG.lat,CFG.lon],{icon,draggable:id==='s'}).addTo(map);
+  if(id==='s'){
+    sHomeMarker=mk;
+    mk.on('dragend',e=>{
+      const p=e.target.getLatLng();
+      CFG.lat=p.lat;CFG.lon=p.lng;
+      document.getElementById('cfgLat').value=p.lat.toFixed(5);
+      document.getElementById('cfgLon').value=p.lng.toFixed(5);
+      drawCone(sMap,'s');
+      if(mMapInited){mMap.setView([CFG.lat,CFG.lon],10);placeHomeMarker(mMap,'m');drawCone(mMap,'m');}
+    });
+  } else { mHomeMarker=mk; }
+}
+
+function drawCone(map,id){
+  const layer = id==='s'?sConeLayer:mConeLayer;
+  if(layer) layer.remove();
+  const origin=[CFG.lat,CFG.lon], pts=[origin];
+  for(let i=0;i<=44;i++){
+    const a=(CFG.dir-CFG.spread)+(2*CFG.spread*i/44);
+    pts.push(destPt(CFG.lat,CFG.lon,CFG.range*1000,a));
+  }
+  pts.push(origin);
+  const nl=L.layerGroup([
+    L.polygon(pts,{color:'rgba(255,179,0,.65)',fillColor:'rgba(255,179,0,.07)',fillOpacity:1,weight:1.5,dashArray:'4 3'}),
+    L.polyline([origin,destPt(CFG.lat,CFG.lon,CFG.range*1000,CFG.dir)],{color:'rgba(255,179,0,.25)',weight:1,dashArray:'2 6'})
+  ]).addTo(map);
+  if(id==='s') sConeLayer=nl; else mConeLayer=nl;
+}
+
+// ═══════════════════════════════════
+// HELICOPTER DETECTION
+// ═══════════════════════════════════
+// Known helicopter operator callsign prefixes (ICAO 3-letter or 2-letter)
+const HELI_CALLSIGNS = new Set([
+  // Rettung / ADAC / DRF
+  'CHX','ADC','DRF','CHR','SAR','NAF','BOD','GAR',
+  // Polizei Deutschland
+  'POL','PBY',
+  // Bundeswehr / Military heli
+  'GAF','BMF',
+  // Offshore / energy
+  'CHC','BHL','NOR','ERA',
+  // News / media
+  'SKY','NBC','CBS','ABC',
+  // Generic heli operators
+  'HEL','HTM','HTC','HLA','HLG',
+]);
+
+// ICAO24 transponder ranges known to be helicopters
+// (selected common European heli operators)
+const HELI_ICAO_PREFIXES = [
+  '3e8',  // German police heli range (partial)
+];
+
+function isHelicopter(f){
+  if(!f) return false;
+  const cs = (f.ident||'').toUpperCase().trim();
+  // check 3-letter prefix
+  if(HELI_CALLSIGNS.has(cs.slice(0,3))) return true;
+  // check 2-letter prefix
+  if(HELI_CALLSIGNS.has(cs.slice(0,2))) return true;
+  // check known type codes
+  const t = (f.type||'').toUpperCase();
+  if(/^(EC\d|AS\d|BO\d|BK\d|H\d{2,3}|R\d{2,3}|S\d{2,3}|AW\d|CH\d|UH\d|AH\d|NH\d|HU\d)/.test(t)) return true;
+  // check operator
+  const op = (f.operator||'').toUpperCase();
+  if(op.includes('HELI') || op.includes('HUBSCHRAUBER') || op.includes('RESCUE') || op.includes('RETTUNG')) return true;
+  return false;
+}
+
+function updatePlanes(map,id){
+  const arr = id==='s'?sPlanes:mPlanes;
+  arr.forEach(m=>m.remove());
+  if(id==='s') sPlanes=[]; else mPlanes=[];
+  allFlights.forEach(f=>{
+    if(!f.lat||!f.lon) return;
+    const ic   = isInCone(f);
+    const heli = isHelicopter(f);
+    const col  = ic ? '#ffb300' : '#4da6ff';
+    const glow = ic ? 'drop-shadow(0 0 4px rgba(255,179,0,.9))' : 'drop-shadow(0 0 3px rgba(77,166,255,.5))';
+    const sz   = ic ? '16px' : '12px';
+
+    const heliSvg = `<svg width="18" height="15" viewBox="0 0 24 20" style="filter:${glow};transition:all .3s;transform:rotate(${f.heading||0}deg);overflow:visible">
+      <!-- 4 main rotor blades — thinner, more filigree -->
+      <ellipse cx="13" cy="10" rx="9.5" ry="1.1" transform="rotate(-40 13 10)" fill="${col}" opacity=".95"/>
+      <ellipse cx="13" cy="10" rx="9.5" ry="1.1" transform="rotate(5 13 10)"  fill="${col}" opacity=".95"/>
+      <ellipse cx="13" cy="10" rx="9.5" ry="1.1" transform="rotate(50 13 10)" fill="${col}" opacity=".95"/>
+      <ellipse cx="13" cy="10" rx="9.5" ry="1.1" transform="rotate(95 13 10)" fill="${col}" opacity=".95"/>
+      <!-- fuselage — smaller -->
+      <ellipse cx="13" cy="10" rx="3.2" ry="2.5" fill="${col}"/>
+      <!-- tail boom — thinner -->
+      <rect x="1.5" y="9.3" width="8.5" height="1.4" rx=".7" fill="${col}"/>
+      <!-- tail rotor housing -->
+      <rect x="1.2" y="7.2" width="1.8" height="5.6" rx="0.9" fill="${col}"/>
+      <!-- rotor hub -->
+      <circle cx="13" cy="10" r="1" fill="#07070a"/>
+    </svg>`;
+
+    const html = heli
+      ? `<div style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px">${heliSvg}</div>`
+      : `<div style="color:${col};font-size:${sz};transform:rotate(${f.heading||0}deg);filter:${glow};transition:all .3s">✈</div>`;
+
+    const icon=L.divIcon({html, iconSize:[18,18], iconAnchor:[9,9], className:''});
+    const mk=L.marker([f.lat,f.lon],{icon}).addTo(map);
+    mk.bindTooltip(f.ident, {
+      permanent: true,
+      direction: 'right',
+      offset: [8, 0],
+      className: 'plane-tooltip'
+    });
+    mk.on('click',()=>selectFlight(f));
+    if(id==='s') sPlanes.push(mk); else mPlanes.push(mk);
+  });
+}
+
+// ═══════════════════════════════════
+// DRAW INTERACTION (settings map)
+// ═══════════════════════════════════
+function startDraw(){
+  drawActive=true;
+  drawSaved={dir:CFG.dir,spread:CFG.spread,range:CFG.range};
+  sMap.dragging.disable();
+  document.getElementById('btnDraw').classList.add('active');
+  document.getElementById('btnDraw').textContent='... VOM STANDORT WEGZIEHEN';
+  document.getElementById('btnOk').style.display='';
+  document.getElementById('btnDiscard').style.display='';
+  document.getElementById('mapHint').textContent='LOSLASSEN UM SICHTLINIE ZU SETZEN';
+}
+function endDraw(){
+  drawActive=false;
+  sMap.dragging.enable();
+  resetDrawBtns();
+  document.getElementById('mapHint').textContent='STANDORT VERSCHIEBBAR · SCROLL = REICHWEITE · SHIFT+SCROLL = ÖFFNUNG';
+}
+function discardDraw(){
+  drawActive=false;
+  sMap.dragging.enable();
+  CFG.dir=drawSaved.dir; CFG.spread=drawSaved.spread; CFG.range=drawSaved.range;
+  syncInputs(); drawCone(sMap,'s'); updateCompass();
+  resetDrawBtns();
+}
+function resetDrawBtns(){
+  document.getElementById('btnDraw').classList.remove('active');
+  document.getElementById('btnDraw').textContent='✏ SICHTLINIE EINZEICHNEN';
+  document.getElementById('btnOk').style.display='none';
+  document.getElementById('btnDiscard').style.display='none';
+}
+function onSMapDown(e){
+  if(!drawActive) return;
+  drawOrigin=e.latlng;
+}
+function onSMapMove(e){
+  if(!drawActive||!drawOrigin) return;
+  CFG.dir=Math.round(bearing(CFG.lat,CFG.lon,e.latlng.lat,e.latlng.lng));
+  CFG.range=Math.max(1,Math.round(haversine(CFG.lat,CFG.lon,e.latlng.lat,e.latlng.lng)));
+  syncInputs(); updateCompass(); drawCone(sMap,'s'); updateConeReadout(); filterRender();
+}
+function onSMapUp(){
+  if(!drawActive) return;
+  drawOrigin=null;
+  endDraw();
+}
+
+// Scroll on settings map
+function setupScrollOnMap(id){
+  document.getElementById(id).addEventListener('wheel',e=>{
+    if(e.shiftKey){
+      CFG.spread=Math.max(1,Math.min(90,CFG.spread+(e.deltaY>0?-1:1)));
+      document.getElementById('cfgSpread').value=CFG.spread;
+    } else {
+      CFG.range=Math.max(1,Math.min(150,CFG.range+(e.deltaY>0?-1:1)));
+      document.getElementById('cfgRange').value=CFG.range;
+    }
+    updateCompass(); drawCone(sMap,'s'); updateConeReadout(); filterRender();
+  },{passive:true});
+}
+
+// ═══════════════════════════════════
+// COMPASS ROSE
+// ═══════════════════════════════════
+let compassDrag=false, compassA0=0, compassD0=0;
+
+function buildCompassTicks(){
+  const t=document.getElementById('cTicks');
+  if(t.children.length) return;
+  let s='';
+  for(let a=0;a<360;a+=10){
+    const len=a%90===0?9:a%30===0?6:3.5;
+    const r=76, rad=(a-90)*Math.PI/180;
+    const x1=90+(r+1)*Math.cos(rad),y1=90+(r+1)*Math.sin(rad);
+    const x2=90+(r+1-len)*Math.cos(rad),y2=90+(r+1-len)*Math.sin(rad);
+    s+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${a%90===0?'#282835':'#18181f'}" stroke-width="1"/>`;
+  }
+  t.innerHTML=s;
+}
+
+function updateCompass(){
+  buildCompassTicks();
+  const cx=90,cy=90,r=74,dir=CFG.dir,spread=CFG.spread;
+  const a1=(dir-spread-90)*Math.PI/180, a2=(dir+spread-90)*Math.PI/180;
+  const x1=cx+r*Math.cos(a1),y1=cy+r*Math.sin(a1);
+  const x2=cx+r*Math.cos(a2),y2=cy+r*Math.sin(a2);
+  const la=spread*2>180?1:0;
+  document.getElementById('cConePath').setAttribute('d',
+    `M ${cx} ${cy} L ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${la} 1 ${x2.toFixed(1)} ${y2.toFixed(1)} Z`);
+  const da=(dir-90)*Math.PI/180;
+  const dl=document.getElementById('cDirLine');
+  dl.setAttribute('x1',cx);dl.setAttribute('y1',cy);
+  dl.setAttribute('x2',(cx+r*Math.cos(da)).toFixed(1));
+  dl.setAttribute('y2',(cy+r*Math.sin(da)).toFixed(1));
+}
+
+const csv=document.getElementById('compassSvg');
+csv.addEventListener('mousedown',e=>{
+  compassDrag=true; compassD0=CFG.dir;
+  const r=csv.getBoundingClientRect();
+  compassA0=Math.atan2(e.clientY-r.top-90,e.clientX-r.left-90)*180/Math.PI+90;
+  e.preventDefault();
+});
+document.addEventListener('mousemove',e=>{
+  if(!compassDrag) return;
+  const r=csv.getBoundingClientRect();
+  const a=Math.atan2(e.clientY-r.top-90,e.clientX-r.left-90)*180/Math.PI+90;
+  CFG.dir=((compassD0+(a-compassA0))%360+360)%360;
+  document.getElementById('cfgDir').value=Math.round(CFG.dir);
+  updateCompass(); drawCone(sMap,'s'); updateConeReadout(); filterRender();
+});
+document.addEventListener('mouseup',()=>compassDrag=false);
+csv.addEventListener('touchstart',e=>{
+  compassDrag=true; compassD0=CFG.dir;
+  const t=e.touches[0],r=csv.getBoundingClientRect();
+  compassA0=Math.atan2(t.clientY-r.top-90,t.clientX-r.left-90)*180/Math.PI+90;
+  e.preventDefault();},{passive:false});
+document.addEventListener('touchmove',e=>{
+  if(!compassDrag) return;
+  const t=e.touches[0],r=csv.getBoundingClientRect();
+  const a=Math.atan2(t.clientY-r.top-90,t.clientX-r.left-90)*180/Math.PI+90;
+  CFG.dir=((compassD0+(a-compassA0))%360+360)%360;
+  document.getElementById('cfgDir').value=Math.round(CFG.dir);
+  updateCompass(); drawCone(sMap,'s'); updateConeReadout(); filterRender();
+});
+document.addEventListener('touchend',()=>compassDrag=false);
+
+// ═══════════════════════════════════
+// INPUT HANDLERS
+// ═══════════════════════════════════
+function onConeInput(){
+  CFG.dir    = parseFloat(document.getElementById('cfgDir').value)    || CFG.dir;
+  CFG.spread = parseFloat(document.getElementById('cfgSpread').value) || CFG.spread;
+  CFG.range  = parseFloat(document.getElementById('cfgRange').value)  || CFG.range;
+  CFG.altMin = parseFloat(document.getElementById('cfgAltMin').value) || 0;
+  CFG.altMax = parseFloat(document.getElementById('cfgAltMax').value) || 15000;
+  CFG.altMetric = document.getElementById('cfgAltMetric').checked;
+  updateCompass(); if(sMapInited) drawCone(sMap,'s');
+  updateConeReadout(); filterRender();
+}
+function onLocInput(){
+  CFG.lat=parseFloat(document.getElementById('cfgLat').value)||CFG.lat;
+  CFG.lon=parseFloat(document.getElementById('cfgLon').value)||CFG.lon;
+  if(sMapInited){sMap.setView([CFG.lat,CFG.lon]);placeHomeMarker(sMap,'s');drawCone(sMap,'s');}
+}
+function syncInputs(){
+  document.getElementById('cfgDir').value    = Math.round(CFG.dir);
+  document.getElementById('cfgSpread').value = Math.round(CFG.spread);
+  document.getElementById('cfgRange').value  = Math.round(CFG.range);
+  document.getElementById('cfgAltMin').value = CFG.altMin;
+  document.getElementById('cfgAltMax').value = CFG.altMax;
+  document.getElementById('cfgLat').value    = CFG.lat.toFixed(5);
+  document.getElementById('cfgLon').value    = CFG.lon.toFixed(5);
+}
+function updateConeReadout(){
+  document.getElementById('clDir').textContent    = Math.round(CFG.dir)+'°';
+  document.getElementById('clSpread').textContent = '±'+Math.round(CFG.spread)+'°';
+  document.getElementById('clRange').textContent  = Math.round(CFG.range)+' KM';
+  document.getElementById('csDir').textContent    = Math.round(CFG.dir);
+  document.getElementById('csSpread').textContent = Math.round(CFG.spread);
+  document.getElementById('csRange').textContent  = Math.round(CFG.range);
+  const cnt = allFlights.filter(isInCone).length;
+  document.getElementById('clCount').textContent  = cnt;
+}
+
+// ═══════════════════════════════════
+// SAVE
+// ═══════════════════════════════════
+function saveSettings(){
+  CFG.lat    = parseFloat(document.getElementById('cfgLat').value)    ||48.7758;
+  CFG.lon    = parseFloat(document.getElementById('cfgLon').value)    ||9.1829;
+  CFG.dir    = parseFloat(document.getElementById('cfgDir').value)    ||220;
+  CFG.spread = parseFloat(document.getElementById('cfgSpread').value) ||25;
+  CFG.range  = parseFloat(document.getElementById('cfgRange').value)  ||15;
+  CFG.altMetric = document.getElementById('cfgAltMetric').checked;
+  CFG.spdKmh    = document.getElementById('cfgSpdKmh').checked;
+  document.getElementById('liveLbl').textContent  = demoMode?'DEMO':'LIVE';
+  document.getElementById('bfRight').textContent  = demoMode?'DEMO-MODUS':'OPENSKY NETWORK';
+  if(mMapInited){placeHomeMarker(mMap,'m');mMap.setView([CFG.lat,CFG.lon],10);drawCone(mMap,'m');}
+  const ok=document.getElementById('saveOk');
+  ok.classList.add('show'); setTimeout(()=>ok.classList.remove('show'),2800);
+  fetchFlights();
+  if(updateTimer) clearInterval(updateTimer);
+  updateTimer=setInterval(fetchFlights,30000);
+}
+
+// ═══════════════════════════════════
+// DATA
+// ═══════════════════════════════════
+// ═══════════════════════════════════
+// AIRLINE + TYPE DATABASE (embedded)
+// ═══════════════════════════════════
+const AIRLINES = {
+  // Deutschland
+  'DLH':'Lufthansa','LH':'Lufthansa','CLH':'Lufthansa CityLine',
+  'EWG':'Eurowings','EW':'Eurowings','GWI':'Germanwings',
+  'CFG':'Condor','DE':'Condor','TUI':'TUIfly','X3':'TUIfly','HLX':'TUIfly',
+  'SXS':'SunExpress','XQ':'SunExpress',
+  'BER':'Air Berlin','AB':'Air Berlin',
+  // Österreich / Schweiz
+  'AUA':'Austrian','OS':'Austrian','OEA':'Laudamotion',
+  'SWR':'Swiss','LX':'Swiss',
+  // UK / Irland
+  'BAW':'British Airways','BA':'British Airways',
+  'EZY':'easyJet','U2':'easyJet','EJU':'easyJet Europe',
+  'RYR':'Ryanair','FR':'Ryanair','RUK':'Ryanair UK',
+  'EIN':'Aer Lingus','EI':'Aer Lingus',
+  'VIR':'Virgin Atlantic','VS':'Virgin Atlantic',
+  'TCX':'TUI Airways','BY':'TUI Airways',
+  'LOG':'Loganair','FLB':'Flybe','BE':'Flybe',
+  // Frankreich
+  'AFR':'Air France','AF':'Air France','HOP':'HOP!',
+  'TVF':'Transavia France','TO':'Transavia France',
+  // Niederlande / Belgien
+  'KLM':'KLM','KL':'KLM',
+  'TRA':'Transavia','HV':'Transavia',
+  'BEL':'Brussels Airlines','SN':'Brussels Airlines',
+  // Spanien / Portugal
+  'VLG':'Vueling','VY':'Vueling',
+  'IBE':'Iberia','IB':'Iberia','IBS':'Iberia Express','I2':'Iberia Express',
+  'TAP':'TAP Air Portugal','TP':'TAP Air Portugal',
+  // Italien
+  'AZA':'Alitalia','AZ':'Alitalia','ITY':'ITA Airways',
+  'RZO':'Air Dolomiti',
+  // Skandinavien
+  'SAS':'SAS','SK':'SAS',
+  'FIN':'Finnair','AY':'Finnair',
+  'NAX':'Norwegian','DY':'Norwegian',
+  'WIF':'Widerøe','WF':'Widerøe',
+  // Polen / Osteuropa / Baltikum
+  'LOT':'LOT Polish','LO':'LOT Polish',
+  'WZZ':'Wizz Air','W6':'Wizz Air','W4':'Wizz Air',
+  'CSA':'Czech Airlines','OK':'Czech Airlines',
+  'BTI':'Air Baltic','BT':'Air Baltic',
+  'SBY':'SmartWings','QS':'SmartWings',
+  'UIA':'Ukraine Intl','PS':'Ukraine Intl',
+  // Türkei
+  'THY':'Turkish Airlines','TK':'Turkish Airlines',
+  'PGT':'Pegasus','PC':'Pegasus',
+  'FHY':'Freebird',
+  // Griechenland / Zypern / Malta
+  'AEE':'Aegean','A3':'Aegean',
+  'OAL':'Olympic Air',
+  // Naher Osten
+  'UAE':'Emirates','EK':'Emirates',
+  'QTR':'Qatar Airways','QR':'Qatar Airways',
+  'ETD':'Etihad','EY':'Etihad',
+  'GFA':'Gulf Air','GF':'Gulf Air',
+  'SVA':'Saudia','SV':'Saudia',
+  'FDB':'flydubai','FZ':'flydubai',
+  'ABY':'Air Arabia','G9':'Air Arabia',
+  'MEA':'Middle East Airlines','ME':'MEA',
+  // Afrika
+  'ETH':'Ethiopian','ET':'Ethiopian',
+  'KQA':'Kenya Airways','KQ':'Kenya Airways',
+  'MSR':'EgyptAir','MS':'EgyptAir',
+  'RAM':'Royal Air Maroc','AT':'Royal Air Maroc',
+  'TUN':'Tunisair','TU':'Tunisair',
+  // Nordamerika
+  'DAL':'Delta','DL':'Delta',
+  'UAL':'United','UA':'United',
+  'AAL':'American','AA':'American',
+  'SWA':'Southwest','WN':'Southwest',
+  'JBU':'JetBlue','B6':'JetBlue',
+  'ASA':'Alaska Airlines','AS':'Alaska Airlines',
+  'ACA':'Air Canada','AC':'Air Canada',
+  'WJA':'WestJet','WS':'WestJet',
+  // Asien
+  'SIA':'Singapore Airlines','SQ':'Singapore Airlines',
+  'CPA':'Cathay Pacific','CX':'Cathay Pacific',
+  'JAL':'Japan Airlines','JL':'Japan Airlines',
+  'ANA':'ANA','NH':'ANA',
+  'KAL':'Korean Air','KE':'Korean Air',
+  'AAR':'Asiana','OZ':'Asiana',
+  'CSN':'China Southern','CZ':'China Southern',
+  'CCA':'Air China','CA':'Air China',
+  'CES':'China Eastern','MU':'China Eastern',
+  'THA':'Thai Airways','TG':'Thai Airways',
+  'MAS':'Malaysia Airlines','MH':'Malaysia Airlines',
+  'GIA':'Garuda','GA':'Garuda',
+  'VNA':'Vietnam Airlines','VN':'Vietnam Airlines',
+  // Sonstige / Charter / Regional
+  'ATV':'Air Travel','OCN':'Omni Air Intl',
+  'PBW':'PAL Airlines','TCW':'Thomas Cook',
+  'RYN':'Rynes Aviation','FCM':'Flyr',
+  'SFG':'SFG Airlines','EXS':'Jet2',
+  'DHX':'DHL Air','DHK':'DHL Aviation',
+  'JOK':'Joint Operations','ANE':'Air Nostrum',
+  'ROT':'TAROM','RO':'TAROM',
+  'AIC':'Air India','AI':'Air India',
+  'CNV':'Convair Airlines',
+  'PEV':'Pegas Fly','HUE':'Heli Air Services','HBK':'Heli Bernina',
+  'WUK':'Wizz Air UK',
+  'MMD':'ASL Airlines',
+  'NJE':'NetJets',
+  'FPO':'First Air',
+  'SVW':'Silverstone Air',
+  'GEC':'Lufthansa Cargo',
+  'BOX':'ASL Airlines Belgium',
+  'PAC':'Polar Air Cargo',
+};
+
+// ICAO prefix → airline (for OpenSky ICAO24 callsigns like "DLH123")
+function airlineFromCallsign(cs){
+  if(!cs) return '---';
+  cs = cs.trim().toUpperCase();
+  return AIRLINES[cs.slice(0,3)] || AIRLINES[cs.slice(0,2)] || cs.slice(0,3);
+}
+
+// Guess aircraft type from airline — rough but better than ----
+const AIRLINE_TYPE = {
+  'DLH':'A32N','EWG':'A319','RYR':'B738','EZY':'A320','WZZ':'A320',
+  'TK':'B738','THY':'B738','SWR':'A320','AUA':'A320','AFR':'A320',
+  'KLM':'B738','BAW':'A320','IBE':'A320','VLG':'A320','CFG':'B757',
+  'DBA':'B738','SXS':'B738','TUI':'B738','DAL':'B763','UAL':'B763',
+  'AAL':'B738','SIA':'A359','UAE':'A388','QTR':'B77W','ETH':'B788',
+};
+function guessType(callsign){
+  const cs = (callsign||'').toUpperCase();
+  return AIRLINE_TYPE[cs.slice(0,3)] || AIRLINE_TYPE[cs.slice(0,2)] || '----';
+}
+// ═══════════════════════════════════
+// AIRPORT ICAO → CITY DATABASE
+// ═══════════════════════════════════
+const AIRPORTS = {
+  // Deutschland
+  'EDDS':'Stuttgart','EDDM':'München','EDDF':'Frankfurt','EDDB':'Berlin',
+  'EDDL':'Düsseldorf','EDDC':'Dresden','EDDK':'Köln','EDDH':'Hamburg',
+  'EDDN':'Nürnberg','EDDT':'Berlin-Tegel','EDDI':'Berlin-Tempelhof',
+  'EDDE':'Erfurt','EDDG':'Münster','EDDI':'Berlin','EDDK':'Köln/Bonn',
+  'EDDP':'Leipzig','EDDR':'Saarbrücken','EDDS':'Stuttgart','EDDU':'Hannover',
+  'EDDV':'Hannover','EDDW':'Bremen','EDFM':'Mannheim','EDJA':'Memmingen',
+  'EDNY':'Friedrichshafen','EDSB':'Karlsruhe','EDTD':'Donaueschingen',
+  // Österreich
+  'LOWW':'Wien','LOWI':'Innsbruck','LOWG':'Graz','LOWS':'Salzburg','LOWK':'Klagenfurt',
+  // Schweiz
+  'LSZH':'Zürich','LSGG':'Genf','LSMM':'Lugano','LSZA':'Lugano','LFSB':'Basel',
+  // Frankreich
+  'LFPG':'Paris CDG','LFPO':'Paris Orly','LFMN':'Nizza','LFLL':'Lyon',
+  'LFBO':'Toulouse','LFBD':'Bordeaux','LFRS':'Nantes','LFML':'Marseille',
+  'LFSB':'Basel-Mulhouse','LFST':'Straßburg',
+  // UK
+  'EGLL':'London Heathrow','EGKK':'London Gatwick','EGLC':'London City',
+  'EGSS':'London Stansted','EGCC':'Manchester','EGPH':'Edinburgh',
+  'EGPF':'Glasgow','EGBB':'Birmingham','EGGD':'Bristol',
+  // Spanien
+  'LEMD':'Madrid','LEBL':'Barcelona','LEPA':'Mallorca','GCLP':'Gran Canaria',
+  'GCFV':'Fuerteventura','GCRR':'Lanzarote','GCTS':'Teneriffa Süd',
+  'GCXO':'Teneriffa Nord','LEVC':'Valencia','LEAL':'Alicante','LEMG':'Málaga',
+  'LEXJ':'Santander','LEBB':'Bilbao','LECO':'A Coruña',
+  // Italien
+  'LIRF':'Rom Fiumicino','LIMC':'Mailand Malpensa','LIME':'Bergamo',
+  'LIPZ':'Venedig','LIRN':'Neapel','LICJ':'Palermo','LICC':'Catania',
+  'LIPE':'Bologna','LIPQ':'Triest','LIRQ':'Florenz',
+  // Niederlande / Belgien
+  'EHAM':'Amsterdam','EBBR':'Brüssel','EBCI':'Charleroi','EHEH':'Eindhoven',
+  // Skandinavien
+  'EKCH':'Kopenhagen','ESSA':'Stockholm','ENGM':'Oslo','EFHK':'Helsinki',
+  'ESGG':'Göteborg','ENBR':'Bergen',
+  // Polen / Tschechien / Ungarn
+  'EPWA':'Warschau','LKPR':'Prag','LHBP':'Budapest','EPKK':'Krakau',
+  'EPGD':'Danzig','EPWR':'Breslau',
+  // Balkan / Südosteuropa
+  'LDZA':'Zagreb','LJLJ':'Ljubljana','LYBE':'Belgrad','LWSK':'Skopje',
+  'LGAV':'Athen','LGRP':'Rhodos','LGIR':'Heraklion','LGKR':'Korfu',
+  'LMML':'Malta','LIBD':'Bari',
+  // Türkei
+  'LTFM':'Istanbul','LTBA':'Istanbul Atatürk','LTAI':'Antalya',
+  'LTBJ':'Izmir','LTAC':'Ankara','LTFE':'Bodrum',
+  // Osteuropa
+  'UUEE':'Moskau SVO','UUDD':'Moskau DME','UKBB':'Kiew','UMMS':'Minsk',
+  'EVRA':'Riga','EYVI':'Vilnius','EETN':'Tallinn',
+  // Naher Osten
+  'OMDB':'Dubai','OOMS':'Muscat','OTHH':'Doha','OERK':'Riad','OEDF':'Dammam',
+  'LLBG':'Tel Aviv','HECA':'Kairo',
+  // Nordafrika
+  'DTMB':'Monastir','DTTA':'Tunis','GMME':'Rabat','GMMN':'Casablanca',
+  'DAAG':'Algier','HLLT':'Tripolis',
+  // Nordamerika
+  'KJFK':'New York JFK','KLAX':'Los Angeles','KORD':'Chicago','KATL':'Atlanta',
+  'KMIA':'Miami','KBOS':'Boston','KDFW':'Dallas','KSFO':'San Francisco',
+  'CYYZ':'Toronto','CYVR':'Vancouver','CYUL':'Montreal',
+  // Asien
+  'VHHH':'Hongkong','RJTT':'Tokyo','WSSS':'Singapur','VTBS':'Bangkok',
+  'VIDP':'Delhi','VABB':'Mumbai','ZBAA':'Peking','ZSPD':'Shanghai',
+  'RKSI':'Seoul','RPLL':'Manila',
+};
+
+function airportCity(icao){
+  if(!icao || icao==='null' || icao==='undefined') return '---';
+  return AIRPORTS[icao.toUpperCase()] || icao.toUpperCase();
+}
+
+const routeCache = {};
+
+async function fetchRouteForFlight(icao24, callsign){
+  if(routeCache[icao24]) return routeCache[icao24];
+  if(!callsign || callsign.length < 3) return null;
+  try{
+    // Via Proxy (bevorzugt, kein CORS-Problem)
+    const base = PROXY_URL;
+    let route = null;
+
+    // 1) Route via Callsign
+    try {
+      const r = await fetch(`${base}/route?callsign=${encodeURIComponent(callsign.trim())}`);
+      if(r.ok){
+        const d = await r.json();
+        if(d && d.route && d.route.length >= 2){
+          route = { origin: airportCity(d.route[0]), dest: airportCity(d.route[d.route.length-1]) };
+        }
+      }
+    } catch(e){}
+
+    // 2) Fallback: Flughistorie via ICAO24
+    if(!route){
+      try {
+        const r2 = await fetch(`${base}/flighthistory?icao24=${icao24}`);
+        if(r2.ok){
+          const arr = await r2.json();
+          if(arr && arr.length){
+            const latest = arr[arr.length-1];
+            route = {
+              origin: airportCity(latest.estDepartureAirport),
+              dest:   airportCity(latest.estArrivalAirport),
+            };
+          }
+        }
+      } catch(e){}
+    }
+
+    if(route){ routeCache[icao24] = route; }
+    return route;
+  }catch(e){ return null; }
+}
+
+// ═══════════════════════════════════
+// OPENSKY FETCH
+// ═══════════════════════════════════
+function onDemoToggle(){
+  demoMode = document.getElementById('cfgDemoMode').checked;
+  document.getElementById('demoModeLabel').textContent = demoMode ? 'DEMO-MODUS AKTIV' : 'ECHTDATEN AKTIV';
+  document.getElementById('liveLbl').textContent  = demoMode ? 'DEMO' : 'LIVE';
+  document.getElementById('bfRight').textContent  = demoMode ? 'DEMO-MODUS' : 'OPENSKY NETWORK';
+  if(updateTimer) clearInterval(updateTimer);
+  if(demoMode){
+    allFlights=genDemo(); filterRender();
+    updateTimer=setInterval(()=>{allFlights=genDemo();filterRender();},12000);
+  } else {
+    fetchFlights();
+    updateTimer=setInterval(fetchFlights,30000);
+  }
+}
+
+async function fetchFlights(){
+  if(demoMode){allFlights=genDemo();filterRender();return;}
+  const status = document.getElementById('openskyStatus');
+  status.textContent='● ABRUFEN...'; status.style.color='#888';
+  try{
+    const pad = Math.max(0.5, CFG.range/80);
+    const url = `${PROXY_URL}/flights`+
+      `?lamin=${CFG.lat-pad}&lomin=${CFG.lon-pad}`+
+      `&lamax=${CFG.lat+pad}&lomax=${CFG.lon+pad}`;
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    const states = data.states || [];
+
+    // OpenSky state vector fields:
+    // [0]icao24 [1]callsign [2]origin_country [3]time_position [4]last_contact
+    // [5]lon [6]lat [7]baro_alt [8]on_ground [9]velocity [10]heading [11]vert_rate
+    // [12]sensors [13]geo_alt [14]squawk [15]spi [16]position_source
+    allFlights = states
+      .filter(s => s && s[5] && s[6] && !s[8]) // has position, not on ground
+      .map(s => {
+        const icao24   = s[0] || '';
+        const callsign = (s[1]||'').trim().toUpperCase() || icao24.toUpperCase();
+        const alt      = (s[7]||s[13]||0) * 3.28084; // metres → feet
+        const gs       = (s[9]||0) * 1.94384; // m/s → knots
+        const route    = routeCache[icao24] || null;
+        return {
+          id:       icao24,
+          ident:    callsign,
+          icao24:   icao24,
+          origin:   route ? route.origin : '---',
+          dest:     route ? route.dest   : '---',
+          lat:      s[6], lon: s[5],
+          alt:      alt,
+          gs:       gs,
+          heading:  s[10]||0,
+          type:     guessType(callsign),
+          operator: airlineFromCallsign(callsign),
+          dist:     haversine(CFG.lat, CFG.lon, s[6], s[5]),
+        };
+      });
+
+    // fetch routes async for visible flights (don't block render)
+    filterRender();
+    status.textContent=`● VERBUNDEN · ${allFlights.length} FLUGZEUGE`;
+    status.style.color='var(--amber)';
+
+    // background route enrichment — prioritise cone flights first, then rest
+    const inCone = allFlights.filter(isInCone);
+    const others = allFlights.filter(f=>!isInCone(f));
+    const toEnrich = [...inCone, ...others].filter(f=>!routeCache[f.icao24]);
+    toEnrich.forEach(async (f, i) => {
+      // stagger requests to avoid rate limiting
+      await new Promise(r=>setTimeout(r, i * 120));
+      const route = await fetchRouteForFlight(f.icao24, f.ident);
+      if(route){
+        f.origin = route.origin;
+        f.dest   = route.dest;
+        // update matching entry in allFlights too
+        const af = allFlights.find(x=>x.icao24===f.icao24);
+        if(af){ af.origin=route.origin; af.dest=route.dest; }
+        filterRender();
+      }
+    });
+
+  }catch(e){
+    status.textContent='● FEHLER: '+e.message; status.style.color='#c44';
+    // fallback to demo on error
+    allFlights=genDemo(); filterRender();
+  }
+}
+
+// ═══════════════════════════════════
+// DEMO DATA
+// ═══════════════════════════════════
+// ═══════════════════════════════════
+// FILTER + RENDER
+// ═══════════════════════════════════
+function isInCone(f){
+  if(!f.lat||!f.lon) return false;
+  const dist=haversine(CFG.lat,CFG.lon,f.lat,f.lon);
+  if(dist>CFG.range) return false;
+  if(angDiff(bearing(CFG.lat,CFG.lon,f.lat,f.lon),CFG.dir)>CFG.spread) return false;
+  if(f.alt<CFG.altMin||f.alt>CFG.altMax) return false;
+  return true;
+}
+function filterRender(){
+  const vis=allFlights.filter(isInCone).sort((a,b)=>a.dist-b.dist);
+  renderFlightList(vis);
+  updateConeReadout();
+  if(sMapInited) updatePlanes(sMap,'s');
+  if(mMapInited) {drawCone(mMap,'m');updatePlanes(mMap,'m');}
+}
+
+// ── SPLIT FLAP HELPERS ──
+function fl(c,cls=''){
+  if(c===' ') return `<div class="fl sp"></div>`;
+  return `<div class="fl ${cls}">${c.toUpperCase()}</div>`;
+}
+
+// Fixed length, leftsbündig, rest = leere Kacheln
+function flStr(s,len,cls=''){
+  return s.toUpperCase().padEnd(len).slice(0,len).split('').map(c=>fl(c,cls)).join('');
+}
+
+// Flugnummer: Buchstaben linksbündig, Ziffern rechtsbündig, Leerzeichen dazwischen
+// z.B. "LH 2345" in 9 Kacheln: L H _ _ _ 2 3 4 5
+function flFlightNum(ident, total){
+  const s = ident.toUpperCase();
+  // split letters and digits
+  const letters = s.match(/^[A-Z]+/)?.[0] || '';
+  const digits  = s.match(/\d+.*$/)?.[0]  || '';
+  const gaps    = total - letters.length - digits.length;
+  const padded  = letters + ' '.repeat(Math.max(0, gaps)) + digits;
+  return padded.padEnd(total).slice(0,total).split('').map(c=>fl(c)).join('');
+}
+
+// Rechtsbündig (für Zahlen: Höhe, Kn, Kurs, Dist)
+function flRight(s, len){
+  return s.toUpperCase().padStart(len).slice(-len).split('').map(c=>fl(c)).join('');
+}
+
+function mkBadge(dist,alt){
+  if(dist<4&&alt<3000) return `<div class="fbadge vis">● SICHTBAR</div>`;
+  if(dist<10&&alt<6000) return `<div class="fbadge app">▼ ANFLUG</div>`;
+  return `<div class="fbadge far">· FERN</div>`;
+}
+
+function renderFlightList(vis){
+  const wrap=document.getElementById('flightsWrap');
+  if(vis.length===0){
+    wrap.innerHTML=`<div class="empty"><div class="empty-icon">🔭</div><div class="empty-text">KEINE FLUGZEUGE IM SICHTBEREICH<br>SICHTLINIE IN EINSTELLUNGEN ANPASSEN</div></div>`;
+    document.getElementById('bfLeft').textContent='0 FLÜGE IM SICHTBEREICH';
+    return;
+  }
+  document.getElementById('bfLeft').textContent=vis.length+(vis.length===1?' FLUG':' FLÜGE')+' IM SICHTBEREICH';
+  wrap.innerHTML='';
+
+  vis.forEach((f,i)=>{
+    const dist   = f.dist||0;
+    const alt    = f.alt||0;
+    const isVis  = dist<4&&alt<3000;
+    const isApp  = !isVis&&dist<10&&alt<6000;
+    const rowCls = isVis?'vis-row':isApp?'app-row':'';
+
+    const altVal  = CFG.altMetric ? Math.round(alt * 0.3048) : Math.round(alt);
+    const altStr  = alt ? ''+altVal : '-----';
+    const spdVal  = f.gs ? (CFG.spdKmh ? Math.round(f.gs * 1.852) : Math.round(f.gs)) : null;
+    const spdStr  = spdVal !== null ? ''+spdVal : '----';
+    const hdgStr  = f.heading ? Math.round(f.heading)+'°': '--°';
+    const distStr = dist      ? dist.toFixed(1)+'K'      : '--K';
+    const typStr  = (f.type||'???').slice(0,4).toUpperCase();
+    const opStr   = (f.operator||'???').slice(0,8).toUpperCase();
+
+    // Route: "ISTANBUL-STUTTGART" padded/truncated to 20, leftsbündig
+    const maxOrig = 9, maxDest = 9; // 9+1+9 = 19, +1 spare = 20
+    const orig = f.origin.toUpperCase().slice(0,maxOrig);
+    const dest = f.dest.toUpperCase().slice(0,maxDest);
+    const routeStr = (orig + '-' + dest).slice(0,20);
+
+    const row = document.createElement('div');
+    row.className=`frow sol-grid ${rowCls}`;
+    row.innerHTML=`
+      <div class="fg">${flFlightNum(f.ident, 9)}</div>
+      <div class="fg">${flStr(routeStr, 20)}</div>
+      <div class="fg">${flStr(opStr, 8)}</div>
+      <div class="fg">${flStr(typStr, 4)}</div>
+      <div class="fg">${flRight(altStr, 5)}</div>
+      <div class="fg">${flRight(spdStr, 4)}</div>
+      <div class="fg">${flRight(distStr, 5)}</div>
+    `;
+    wrap.appendChild(row);
+
+    requestAnimationFrame(()=>{
+      setTimeout(()=>{
+        row.classList.add('in');
+        const flaps=row.querySelectorAll('.fl:not(.sp)');
+        flaps.forEach((fl,fi)=>{
+          setTimeout(()=>{fl.classList.add('flip');},fi*14);
+          setTimeout(()=>{fl.classList.remove('flip');},fi*14+120);
+        });
+      },i*70);
+    });
+  });
+}
+
+function selectFlight(f){ /* no-op – all data shown inline */ }
+
+// ═══════════════════════════════════
+// DEMO DATA
+// ═══════════════════════════════════
+function genDemo(){
+  return[
+    {id:'LH2345',ident:'LH2345',origin:'Frankfurt',dest:'Stuttgart',lat:48.83,lon:9.04,alt:850,gs:195,heading:148,type:'A320',operator:'Lufthansa'},
+    {id:'EW9831',ident:'EW9831',origin:'Berlin',dest:'Stuttgart',lat:48.86,lon:9.11,alt:1300,gs:225,heading:162,type:'A319',operator:'Eurowings'},
+    {id:'FR4421',ident:'FR4421',origin:'Dublin',dest:'Stuttgart',lat:48.91,lon:9.16,alt:3400,gs:275,heading:172,type:'B738',operator:'Ryanair'},
+    {id:'DLH18C',ident:'DLH18C',origin:'München',dest:'Hamburg',lat:48.69,lon:9.42,alt:9600,gs:455,heading:338,type:'A321',operator:'Lufthansa'},
+    {id:'TK1763',ident:'TK1763',origin:'Istanbul',dest:'Stuttgart',lat:48.76,lon:9.23,alt:5100,gs:375,heading:282,type:'B738',operator:'Turkish'},
+    {id:'CHX001',ident:'CHX001',origin:'Stuttgart',dest:'Ulm',lat:48.74,lon:9.31,alt:1200,gs:120,heading:95,type:'EC135',operator:'DRF Luftrettung'},
+  ].map(f=>({...f,
+    lat:f.lat+(Math.random()-.5)*.02,
+    lon:f.lon+(Math.random()-.5)*.02,
+    dist:haversine(CFG.lat,CFG.lon,f.lat,f.lon)
+  }));
+}
+
+// ═══════════════════════════════════
+// GEO HELPERS
+// ═══════════════════════════════════
+function bearing(la1,lo1,la2,lo2){const f1=la1*Math.PI/180,f2=la2*Math.PI/180,dl=(lo2-lo1)*Math.PI/180;return(Math.atan2(Math.sin(dl)*Math.cos(f2),Math.cos(f1)*Math.sin(f2)-Math.sin(f1)*Math.cos(f2)*Math.cos(dl))*180/Math.PI+360)%360;}
+function angDiff(a,b){let d=Math.abs(a-b)%360;return d>180?360-d:d;}
+function haversine(la1,lo1,la2,lo2){const R=6371,dLa=(la2-la1)*Math.PI/180,dLo=(lo2-lo1)*Math.PI/180;const a=Math.sin(dLa/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dLo/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
+function destPt(lat,lon,distM,brng){const R=6371000,d=distM/R,t=brng*Math.PI/180;const f1=lat*Math.PI/180,l1=lon*Math.PI/180;const f2=Math.asin(Math.sin(f1)*Math.cos(d)+Math.cos(f1)*Math.sin(d)*Math.cos(t));const l2=l1+Math.atan2(Math.sin(t)*Math.sin(d)*Math.cos(f1),Math.cos(d)-Math.sin(f1)*Math.sin(f2));return[f2*180/Math.PI,l2*180/Math.PI];}
+
+function onSpdUnitChange(){
+  CFG.spdKmh = document.getElementById('cfgSpdKmh').checked;
+  document.getElementById('spdUnitLabel').textContent = CFG.spdKmh ? 'KMH AKTIV' : 'KN → KMH UMSCHALTEN';
+  buildHeader();
+  filterRender();
+}
+
+function onAltUnitChange(){
+  CFG.altMetric = document.getElementById('cfgAltMetric').checked;
+  const unit = CFG.altMetric ? 'm' : 'ft';
+  document.getElementById('altUnitMin').textContent = unit;
+  document.getElementById('altUnitMax').textContent = unit;
+  document.getElementById('altUnitLabel').textContent = CFG.altMetric ? 'METER AKTIV' : 'FT → METER UMSCHALTEN';
+  buildHeader();
+  filterRender();
+}
+
+function buildHeader(){
+  const altLbl = CFG.altMetric ? 'Höhe m' : 'Höhe ft';
+  const spdLbl = CFG.spdKmh   ? 'Kmh'    : 'Kn';
+  const cols=['Flugnr','Von - Nach','Airline','Typ', altLbl, spdLbl,'Dist'];
+  document.getElementById('boardHeader').innerHTML=
+    cols.map(l=>`<div class="bh">${l.toUpperCase()}</div>`).join('');
+}
+
+// ═══════════════════════════════════
+// SERVICE WORKER REGISTRATION
+// ═══════════════════════════════════
+if('serviceWorker' in navigator){
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js')
+      .catch(e => console.log('SW registration failed:', e));
+  });
+}
+window.onload=()=>{
+  buildHeader();
+  buildCompassTicks(); updateCompass(); syncInputs(); updateConeReadout();
+  demoMode = true;
+  document.getElementById('cfgDemoMode').checked = true;
+  allFlights=genDemo(); filterRender();
+  updateTimer=setInterval(()=>{allFlights=genDemo();filterRender();},12000);
+};
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#ffb300">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Fenster-Tracker">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Fenster-Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<style>
+:root {
+  --bg:       #070709;
+  --panel:    #0d0d10;
+  --surface:  #13131a;
+  --border:   #1c1c24;
+  --amber:    #ffb300;
+  --amber-lo: rgba(255,179,0,0.09);
+  --amber-md: rgba(255,179,0,0.22);
+  --white:    #ede8d8;
+  --green:    #3ddc68;
+  --blue:     #4da6ff;
+  --blue-lo:  rgba(77,166,255,0.10);
+  --muted:    #6a6a80;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;overflow:hidden;}
+body{background:var(--bg);font-family:'Share Tech Mono',monospace;color:var(--amber);display:flex;flex-direction:column;}
+
+/* scanlines */
+body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.055) 2px,rgba(0,0,0,0.055) 4px);pointer-events:none;z-index:9999;}
+
+/* ── TOPBAR ── */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 18px;height:44px;background:#040406;border-bottom:1px solid var(--border);flex-shrink:0;z-index:100;}
+.logo{font-family:'Bebas Neue',sans-serif;font-size:1.2rem;letter-spacing:.3em;color:var(--amber);}
+.live-pill{display:flex;align-items:center;gap:5px;padding:3px 9px;border:1px solid rgba(61,220,104,.2);background:rgba(61,220,104,.05);border-radius:1px;}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);animation:blink 2s infinite;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.live-lbl{font-size:.52rem;letter-spacing:.18em;color:var(--green);}
+.topbar-right{display:flex;align-items:center;gap:2px;}
+.clock{font-size:.72rem;color:var(--muted);letter-spacing:.1em;margin-right:10px;}
+.tab-btn{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--muted);font-family:'Share Tech Mono',monospace;font-size:.62rem;letter-spacing:.18em;padding:13px 16px;cursor:pointer;transition:all .18s;height:44px;}
+.tab-btn:hover{color:var(--amber);}
+.tab-btn.active{color:var(--amber);border-bottom-color:var(--amber);}
+
+/* ── PAGES ── */
+.page{display:none;flex:1;overflow:hidden;flex-direction:column;}
+.page.active{display:flex;}
+
+/* ══════════════════════════
+   MAIN PAGE
+══════════════════════════ */
+.main-layout{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+
+/* flights side */
+.flights-side{display:flex;flex-direction:column;overflow:hidden;width:100%;}
+
+/* ── SOLARI COLUMN WIDTHS — fixed flap counts ── */
+/* 9 · 20 · 8 · 4 · 6 · 4 · 5 · badge */
+.sol-grid{
+  display:grid;
+  grid-template-columns:
+    calc(9*18px + 8*1px)    /* Flugnr   9 flaps */
+    calc(20*18px + 19*1px)  /* Route   20 flaps */
+    calc(8*18px + 7*1px)    /* Airline  8 flaps */
+    calc(4*18px + 3*1px)    /* Typ      4 flaps */
+    calc(5*18px + 4*1px)    /* Höhe ft  5 flaps */
+    calc(4*18px + 3*1px)    /* Kn       4 flaps */
+    calc(5*18px + 4*1px);    /* Dist     5 flaps */
+  column-gap:8px;
+  align-items:center;
+  padding:0 12px;
+}
+
+/* ── BOARD HEADER ── */
+.board-header{
+  padding:7px 0 5px;
+  background:#040406;
+  border-bottom:2px solid #1e1e2a;
+  flex-shrink:0;
+}
+
+.bh{font-family:'Bebas Neue',sans-serif;font-size:.78rem;color:var(--amber);letter-spacing:.18em;opacity:.6;padding:0 2px;text-align:center;}
+.bh span{
+  font-family:'Bebas Neue',sans-serif;
+  font-size:.72rem;
+  color:var(--amber);
+  letter-spacing:.2em;
+  opacity:.6;
+  white-space:nowrap;
+}
+
+/* thin separator line between header and rows */
+.board-sep{height:1px;background:linear-gradient(90deg,transparent,#1e1e2a 10%,#1e1e2a 90%,transparent);flex-shrink:0;margin:0 12px;}
+
+/* ── FLIGHTS WRAP ── */
+.flights-wrap{flex:1;overflow-y:auto;padding:4px 0 6px;display:flex;flex-direction:column;gap:2px;}
+.flights-wrap::-webkit-scrollbar{width:2px;}
+.flights-wrap::-webkit-scrollbar-thumb{background:#1c1c24;}
+
+/* ── SOLARI ROW ── */
+.frow{
+  padding:2px 0 2px 6px;
+  opacity:0;transform:translateY(4px);
+  transition:opacity .3s,transform .3s;
+  border-left:2px solid transparent;
+}
+.frow.in{opacity:1;transform:translateY(0);}
+.frow.vis-row{border-left-color:var(--amber);}
+.frow.app-row{border-left-color:var(--blue);}
+
+/* ── SPLIT FLAP TILE ── */
+.fg{display:flex;gap:1px;align-items:center;}
+.fl{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:17px;height:28px;flex-shrink:0;
+  background:#141418;border-radius:1px;
+  font-family:'Bebas Neue',sans-serif;font-size:1rem;
+  color:var(--white);
+  position:relative;overflow:hidden;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05),inset 0 -1px 0 rgba(0,0,0,.45),0 1px 2px rgba(0,0,0,.6);
+}
+.fl::after{content:'';position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(0,0,0,.48);z-index:2;}
+.fl.flip{animation:solflip .11s ease-in-out;}
+@keyframes solflip{
+  0%{transform:scaleY(1)}
+  44%{transform:scaleY(.04);background:#252535}
+  56%{transform:scaleY(.04);background:#141418}
+  100%{transform:scaleY(1)}
+}
+.fl.sp{background:#141418;box-shadow:inset 0 1px 0 rgba(255,255,255,.05),inset 0 -1px 0 rgba(0,0,0,.45),0 1px 2px rgba(0,0,0,.6);width:17px;opacity:1;}
+.fl.sp::after{content:'';position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(0,0,0,.48);z-index:2;display:block;}
+.fl.w{width:auto;min-width:17px;padding:0 3px;font-size:.78rem;letter-spacing:.02em;}
+
+/* status badge */
+.fbadge{
+  display:inline-flex;align-items:center;justify-content:center;
+  padding:3px 7px;border-radius:1px;height:28px;
+  font-size:.48rem;letter-spacing:.1em;font-weight:bold;white-space:nowrap;
+  font-family:'Share Tech Mono',monospace;
+}
+.fbadge.vis{background:rgba(255,179,0,.12);color:var(--amber);border:1px solid rgba(255,179,0,.38);animation:gbv 2.5s infinite;}
+@keyframes gbv{0%,100%{box-shadow:0 0 5px rgba(255,179,0,.1)}50%{box-shadow:0 0 12px rgba(255,179,0,.5)}}
+.fbadge.app{background:rgba(77,166,255,.08);color:var(--blue);border:1px solid rgba(77,166,255,.28);}
+.fbadge.far{background:transparent;color:#4a4a60;border:1px solid #2a2a38;}
+
+/* map toggle bar */
+.map-toggle-bar{display:flex;align-items:center;gap:10px;padding:6px 14px;background:#040406;border-top:1px solid var(--border);flex-shrink:0;}
+.map-toggle-lbl{font-size:.52rem;letter-spacing:.16em;color:var(--muted);}
+.tog{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0;}
+.tog input{opacity:0;width:0;height:0;}
+.tog-track{position:absolute;inset:0;background:#141418;border:1px solid #252530;border-radius:10px;transition:all .2s;}
+.tog input:checked ~ .tog-track{background:var(--amber-md);border-color:rgba(255,179,0,.4);}
+.tog-thumb{position:absolute;top:3px;left:3px;width:12px;height:12px;background:#30303a;border-radius:50%;transition:all .2s;}
+.tog input:checked ~ .tog-track .tog-thumb{left:19px;background:var(--amber);}
+.cone-summary{margin-left:auto;font-size:.52rem;color:#55556a;letter-spacing:.1em;}
+.cone-summary span{color:var(--amber);}
+
+/* map panel on main page */
+.map-panel{height:240px;flex-shrink:0;border-top:1px solid var(--border);display:none;}
+.map-panel.show{display:block;}
+#mainMap{width:100%;height:100%;filter:brightness(.7) saturate(.45);}
+
+/* plane hover label */
+.plane-label{
+  position:absolute;
+  background:rgba(7,7,10,.88);
+  border:1px solid rgba(255,179,0,.35);
+  color:var(--amber);
+  font-family:'Bebas Neue',sans-serif;
+  font-size:.72rem;letter-spacing:.14em;
+  padding:2px 6px;border-radius:1px;
+  white-space:nowrap;pointer-events:none;
+  transform:translate(10px,-50%);
+  z-index:9999;
+}
+
+/* empty */
+.empty{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;}
+.empty-icon{font-size:2.2rem;opacity:.08;}
+.empty-text{font-size:.58rem;color:#4a4a60;letter-spacing:.18em;text-align:center;line-height:2.4;}
+
+/* footer */
+.board-footer{display:flex;justify-content:space-between;align-items:center;padding:5px 14px;background:#040406;border-top:1px solid var(--border);flex-shrink:0;}
+.bf{font-size:.52rem;color:#5a5a70;letter-spacing:.14em;}
+
+/* ══════════════════════════
+   SETTINGS PAGE
+══════════════════════════ */
+.settings-page{overflow:hidden;}
+.settings-layout{display:grid;grid-template-columns:1fr 340px;height:100%;overflow:hidden;}
+
+/* left: map always on */
+.settings-map-wrap{position:relative;border-right:1px solid var(--border);overflow:hidden;}
+#settingsMap{width:100%;height:100%;filter:brightness(.7) saturate(.45);}
+
+/* map UI overlays */
+.map-overlay-tl{position:absolute;top:10px;left:10px;z-index:500;display:flex;flex-direction:column;gap:6px;}
+.map-overlay-br{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);z-index:500;}
+.mbtn{background:rgba(7,7,9,.88);border:1px solid var(--border);color:var(--muted);font-family:'Share Tech Mono',monospace;font-size:.58rem;letter-spacing:.14em;padding:6px 11px;cursor:pointer;transition:all .15s;backdrop-filter:blur(6px);border-radius:1px;}
+.mbtn:hover{border-color:var(--amber);color:var(--amber);background:rgba(255,179,0,.06);}
+.mbtn.active{background:rgba(255,179,0,.08);border-color:var(--amber);color:var(--amber);}
+.mbtn.ok{border-color:rgba(61,220,104,.35);color:var(--green);}
+.map-hint{background:rgba(4,4,6,.9);border:1px solid var(--border);color:#5a5a72;font-size:.55rem;letter-spacing:.13em;padding:5px 12px;white-space:nowrap;backdrop-filter:blur(6px);border-radius:1px;transition:opacity .3s;}
+
+/* right: settings panel */
+.settings-panel{overflow-y:auto;background:var(--panel);display:flex;flex-direction:column;}
+.settings-panel::-webkit-scrollbar{width:3px;}
+.settings-panel::-webkit-scrollbar-thumb{background:#1c1c24;}
+.settings-scroll{padding:18px 18px 28px;display:flex;flex-direction:column;gap:14px;}
+
+.scard{background:var(--surface);border:1px solid var(--border);border-radius:2px;overflow:hidden;}
+.scard-head{padding:9px 14px;background:#0a0a0d;border-bottom:1px solid var(--border);}
+.scard-title{font-family:'Bebas Neue',sans-serif;font-size:.85rem;letter-spacing:.2em;color:var(--amber);}
+.scard-sub{font-size:.48rem;color:#5a5a70;letter-spacing:.1em;margin-top:1px;}
+.scard-body{padding:13px 14px;}
+
+/* fields */
+.field-row{display:flex;gap:10px;margin-bottom:9px;flex-wrap:wrap;}
+.field-row:last-child{margin-bottom:0;}
+.field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:90px;}
+.field label{font-size:.46rem;color:#5a5a72;letter-spacing:.2em;text-transform:uppercase;}
+.unit-wrap{display:flex;}
+.unit-wrap input{flex:1;background:#080810;border:1px solid #1c1c24;border-right:none;border-radius:2px 0 0 2px;padding:7px 9px;color:var(--white);font-family:'Share Tech Mono',monospace;font-size:.75rem;letter-spacing:.05em;outline:none;transition:border-color .18s;min-width:0;}
+.unit-wrap input:focus{border-color:var(--amber);}
+.unit-wrap span{background:#0e0e14;border:1px solid #1c1c24;border-left:none;padding:0 8px;display:flex;align-items:center;font-size:.55rem;color:#5a5a72;letter-spacing:.1em;border-radius:0 2px 2px 0;white-space:nowrap;}
+
+/* cone live preview row */
+.cone-live{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#0a0a0d;border:1px solid var(--border);border-radius:2px;margin-bottom:10px;}
+.cone-live-item{flex:1;text-align:center;}
+.cone-live-item label{display:block;font-size:.42rem;color:#55556a;letter-spacing:.16em;text-transform:uppercase;margin-bottom:2px;}
+.cone-live-item span{font-family:'Bebas Neue',sans-serif;font-size:1.1rem;color:var(--amber);letter-spacing:.04em;}
+
+/* compass */
+.compass-wrap{display:flex;justify-content:center;margin-bottom:10px;}
+
+/* save */
+.save-btn{width:100%;background:var(--amber);color:#000;border:none;border-radius:2px;padding:10px;font-family:'Bebas Neue',sans-serif;font-size:.95rem;letter-spacing:.2em;cursor:pointer;transition:opacity .2s;}
+.save-btn:hover{opacity:.85;}
+.save-ok{display:block;text-align:center;font-size:.55rem;color:var(--green);letter-spacing:.15em;margin-top:6px;opacity:0;transition:opacity .3s;height:14px;}
+.save-ok.show{opacity:1;}
+
+/* Leaflet dark */
+.leaflet-container{background:#040407!important;}
+.leaflet-tile{filter:brightness(.45) saturate(.28)!important;}
+.leaflet-control-zoom a{background:#0e0e14!important;color:var(--amber)!important;border-color:#1c1c24!important;}
+.plane-tooltip{
+  background:rgba(7,7,10,.92)!important;
+  border:1px solid rgba(255,179,0,.4)!important;
+  border-radius:1px!important;
+  color:var(--amber)!important;
+  font-family:'Bebas Neue',sans-serif!important;
+  font-size:.75rem!important;letter-spacing:.14em!important;
+  padding:2px 7px!important;
+  box-shadow:0 0 8px rgba(255,179,0,.2)!important;
+  white-space:nowrap;
+}
+.plane-tooltip::before{display:none!important;}
+</style>
+</head>
+<body>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:14px;">
+    <div class="logo">✈ FENSTER·TRACKER</div>
+    <div class="live-pill"><div class="live-dot"></div><span class="live-lbl" id="liveLbl">DEMO</span></div>
+  </div>
+  <div class="topbar-right">
+    <span class="clock" id="clock">--:--:--</span>
+    <button class="tab-btn active" onclick="switchTab('main')"     id="tab-main">FLÜGE</button>
+    <button class="tab-btn"        onclick="switchTab('settings')" id="tab-settings">⚙ EINSTELLUNGEN</button>
+  </div>
+</div>
+
+<!-- ══════════════ MAIN PAGE ══════════════ -->
+<div class="page active" id="page-main">
+  <div class="main-layout">
+
+    <!-- flights column -->
+    <div class="flights-side" id="flightsSide">
+      <div class="board-header sol-grid" id="boardHeader"></div>
+      <div class="board-sep"></div>
+      <div class="flights-wrap" id="flightsWrap"></div>
+      <!-- MAP TOGGLE BAR -->
+      <div class="map-toggle-bar">
+        <label class="tog">
+          <input type="checkbox" id="mainMapToggle" onchange="toggleMainMap()">
+          <div class="tog-track"><div class="tog-thumb"></div></div>
+        </label>
+        <span class="map-toggle-lbl">ÜBERSICHTSKARTE ANZEIGEN</span>
+        <span class="cone-summary" id="coneSummary">
+          <span id="csDir">—</span>° · ±<span id="csSpread">—</span>° · <span id="csRange">—</span> KM
+        </span>
+      </div>
+      <div class="board-footer">
+        <span class="bf" id="bfLeft">WARTE AUF KONFIGURATION</span>
+        <span class="bf" id="bfRight">FLIGHTAWARE · DEMO</span>
+      </div>
+    </div>
+
+    <!-- map panel (main) -->
+    <div class="map-panel" id="mainMapPanel">
+      <div id="mainMap"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════ SETTINGS PAGE ══════════════ -->
+<div class="page" id="page-settings">
+<div class="settings-layout">
+
+  <!-- LEFT: always-on map -->
+  <div class="settings-map-wrap">
+    <div id="settingsMap"></div>
+    <div class="map-overlay-tl">
+      <button class="mbtn" id="btnDraw" onclick="startDraw()">✏ SICHTLINIE EINZEICHNEN</button>
+      <button class="mbtn ok"  id="btnOk"   onclick="endDraw()"   style="display:none">✓ FERTIG</button>
+      <button class="mbtn"     id="btnDiscard" onclick="discardDraw()" style="display:none">✕ VERWERFEN</button>
+    </div>
+    <div class="map-overlay-br">
+      <div class="map-hint" id="mapHint">STANDORT-MARKER VERSCHIEBBAR · SCROLL = REICHWEITE · SHIFT+SCROLL = ÖFFNUNG</div>
+    </div>
+  </div>
+
+  <!-- RIGHT: settings panel -->
+  <div class="settings-panel">
+  <div class="settings-scroll">
+
+    <!-- Connection -->
+    <div class="scard">
+      <div class="scard-head">
+        <div class="scard-title">DATENQUELLE</div>
+        <div class="scard-sub">OPENSKY NETWORK · KOSTENLOS</div>
+      </div>
+      <div class="scard-body">
+        <div style="font-size:.6rem;color:var(--muted);letter-spacing:.1em;line-height:1.9;">
+          ECHTDATEN VIA <span style="color:var(--amber)">OPENSKY NETWORK</span><br>
+          KOSTENLOS · KEINE REGISTRIERUNG NÖTIG<br>
+          AKTUALISIERUNG ALLE 30 SEKUNDEN
+        </div>
+        <div style="margin-top:10px;display:flex;align-items:center;gap:10px;">
+          <label class="tog">
+            <input type="checkbox" id="cfgDemoMode" onchange="onDemoToggle()" checked>
+            <div class="tog-track"><div class="tog-thumb"></div></div>
+          </label>
+          <span style="font-size:.62rem;letter-spacing:.14em;color:var(--muted);">
+            <span id="demoModeLabel">DEMO-MODUS AKTIV</span>
+          </span>
+        </div>
+        <div style="margin-top:8px;">
+          <div id="openskyStatus" style="font-size:.58rem;letter-spacing:.12em;color:#5a5a72;">● NICHT VERBUNDEN</div>
+        </div>
+        <div class="field-row" style="margin-top:12px;">
+          <div class="field">
+            <label>Breitengrad</label>
+            <div class="unit-wrap"><input type="number" id="cfgLat" value="48.7758" step="0.0001" oninput="onLocInput()"/><span>° N</span></div>
+          </div>
+          <div class="field">
+            <label>Längengrad</label>
+            <div class="unit-wrap"><input type="number" id="cfgLon" value="9.1829" step="0.0001" oninput="onLocInput()"/><span>° E</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cone config + compass merged -->
+    <div class="scard">
+      <div class="scard-head">
+        <div class="scard-title">SICHTLINIE</div>
+        <div class="scard-sub">KARTE ODER WERTE DIREKT BEARBEITEN</div>
+      </div>
+      <div class="scard-body">
+
+        <!-- live readout -->
+        <div class="cone-live">
+          <div class="cone-live-item"><label>Richtung</label><span id="clDir">220°</span></div>
+          <div class="cone-live-item"><label>Öffnung</label><span id="clSpread">±25°</span></div>
+          <div class="cone-live-item"><label>Reichweite</label><span id="clRange">15 KM</span></div>
+          <div class="cone-live-item"><label>Im Kegel</label><span id="clCount" style="color:var(--green)">0</span></div>
+        </div>
+
+        <!-- compass rose -->
+        <div class="compass-wrap">
+          <svg id="compassSvg" width="180" height="180" viewBox="0 0 180 180" style="cursor:grab;">
+            <circle cx="90" cy="90" r="78" fill="none" stroke="#1a1a22" stroke-width="1"/>
+            <circle cx="90" cy="90" r="78" fill="#0a0a0f" fill-opacity=".6"/>
+            <g id="cTicks"></g>
+            <text x="90" y="13"  text-anchor="middle" font-family="Bebas Neue" font-size="11" fill="#2a2a36" letter-spacing="1">N</text>
+            <text x="90" y="175" text-anchor="middle" font-family="Bebas Neue" font-size="11" fill="#1e1e28" letter-spacing="1">S</text>
+            <text x="8"  y="94"  text-anchor="middle" font-family="Bebas Neue" font-size="11" fill="#1e1e28" letter-spacing="1">W</text>
+            <text x="172" y="94" text-anchor="middle" font-family="Bebas Neue" font-size="11" fill="#1e1e28" letter-spacing="1">E</text>
+            <path id="cConePath" fill="rgba(255,179,0,.1)" stroke="rgba(255,179,0,.55)" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <line id="cDirLine" stroke="rgba(255,179,0,.3)" stroke-width="1" stroke-dasharray="3 5"/>
+            <circle cx="90" cy="90" r="3.5" fill="var(--amber)"/>
+            <text x="90" y="104" text-anchor="middle" font-family="Share Tech Mono" font-size="6.5" fill="#25252f">ZIEHEN ZUM DREHEN</text>
+          </svg>
+        </div>
+
+        <!-- numeric inputs -->
+        <div class="field-row">
+          <div class="field">
+            <label>Richtung</label>
+            <div class="unit-wrap"><input type="number" id="cfgDir" value="220" min="0" max="359" step="1" oninput="onConeInput()"/><span>°</span></div>
+          </div>
+          <div class="field">
+            <label>Öffnung (±)</label>
+            <div class="unit-wrap"><input type="number" id="cfgSpread" value="25" min="1" max="90" step="1" oninput="onConeInput()"/><span>°</span></div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Reichweite</label>
+            <div class="unit-wrap"><input type="number" id="cfgRange" value="15" min="1" max="150" step="1" oninput="onConeInput()"/><span>km</span></div>
+          </div>
+          <div class="field"><!-- spacer --></div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Mindesthöhe</label>
+            <div class="unit-wrap"><input type="number" id="cfgAltMin" value="0" min="0" max="50000" step="100" oninput="onConeInput()"/><span id="altUnitMin">ft</span></div>
+          </div>
+          <div class="field">
+            <label>Maximalhöhe</label>
+            <div class="unit-wrap"><input type="number" id="cfgAltMax" value="15000" min="100" max="60000" step="100" oninput="onConeInput()"/><span id="altUnitMax">ft</span></div>
+          </div>
+        </div>
+        <div class="field-row" style="margin-top:4px;">
+          <div class="field">
+            <label>Höheneinheit</label>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:4px;">
+              <label class="tog">
+                <input type="checkbox" id="cfgAltMetric" onchange="onAltUnitChange()">
+                <div class="tog-track"><div class="tog-thumb"></div></div>
+              </label>
+              <span style="font-size:.62rem;letter-spacing:.14em;color:var(--muted);">
+                <span id="altUnitLabel">FT → METER UMSCHALTEN</span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="field-row" style="margin-top:4px;">
+          <div class="field">
+            <label>Geschwindigkeitseinheit</label>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:4px;">
+              <label class="tog">
+                <input type="checkbox" id="cfgSpdKmh" onchange="onSpdUnitChange()">
+                <div class="tog-track"><div class="tog-thumb"></div></div>
+              </label>
+              <span style="font-size:.62rem;letter-spacing:.14em;color:var(--muted);">
+                <span id="spdUnitLabel">KN → KMH UMSCHALTEN</span>
+              </span>
+            </div>
+          </div>
+      </div>
+    </div>
+
+    <!-- Save -->
+    <button class="save-btn" onclick="saveSettings()">EINSTELLUNGEN SPEICHERN</button>
+    <span class="save-ok" id="saveOk">✓ GESPEICHERT — FLÜGE WERDEN AKTUALISIERT</span>
+
+  </div><!-- /scroll -->
+  </div><!-- /panel -->
+
+</div><!-- /layout -->
+</div><!-- /page-settings -->
+
+<script>
+// ═══════════════════════════════════
+// STATE
+// ═══════════════════════════════════
+// Vercel Serverless Functions — funktioniert auf jedem Gerät ohne eigenen Server
 const PROXY_URL = '';
 
 let CFG = {apiKey:'', lat:48.7758, lon:9.1829, dir:220, spread:25, range:15, altMin:0, altMax:15000, altMetric:false, spdKmh:false};
