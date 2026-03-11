@@ -1,1 +1,25 @@
+{
+  "name": "Fenster-Tracker",
+  "short_name": "Fenster-Tracker",
+  "description": "Flugzeug-Tracker im Solari-Board Stil",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07070a",
+  "theme_color": "#ffb300",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
 
