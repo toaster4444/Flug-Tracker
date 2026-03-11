@@ -1,9 +1,11 @@
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { callsign } = req.query;
   try {
     const url = `https://opensky-network.org/api/routes?callsign=${encodeURIComponent(callsign.trim())}`;
-    const r = await fetch(url);
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!r.ok) return res.status(r.status).json({ error: 'not found' });
     const data = await r.json();
     res.json(data);
