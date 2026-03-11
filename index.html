@@ -475,6 +475,9 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 // ═══════════════════════════════════
 // STATE
 // ═══════════════════════════════════
+// Vercel Serverless Functions — funktioniert auf jedem Gerät ohne eigenen Server
+const PROXY_URL = '';
+
 let CFG = {apiKey:'', lat:48.7758, lon:9.1829, dir:220, spread:25, range:15, altMin:0, altMax:15000, altMetric:false, spdKmh:false};
 let demoMode = true;
 let sMap=null, mMap=null, sHomeMarker=null, mHomeMarker=null;
@@ -1075,33 +1078,39 @@ async function fetchRouteForFlight(icao24, callsign){
   if(routeCache[icao24]) return routeCache[icao24];
   if(!callsign || callsign.length < 3) return null;
   try{
-    // Try OpenSky routes API first — takes callsign, returns origin/dest
-    const url = `https://opensky-network.org/api/routes?callsign=${encodeURIComponent(callsign.trim())}`;
-    const res = await fetch(url);
-    if(res.ok){
-      const data = await res.json();
-      if(data && data.route && data.route.length >= 2){
-        const route = {
-          origin: airportCity(data.route[0]),
-          dest:   airportCity(data.route[data.route.length-1]),
-        };
-        routeCache[icao24] = route;
-        return route;
+    // Via Proxy (bevorzugt, kein CORS-Problem)
+    const base = PROXY_URL;
+    let route = null;
+
+    // 1) Route via Callsign
+    try {
+      const r = await fetch(`${base}/route?callsign=${encodeURIComponent(callsign.trim())}`);
+      if(r.ok){
+        const d = await r.json();
+        if(d && d.route && d.route.length >= 2){
+          route = { origin: airportCity(d.route[0]), dest: airportCity(d.route[d.route.length-1]) };
+        }
       }
+    } catch(e){}
+
+    // 2) Fallback: Flughistorie via ICAO24
+    if(!route){
+      try {
+        const r2 = await fetch(`${base}/flighthistory?icao24=${icao24}`);
+        if(r2.ok){
+          const arr = await r2.json();
+          if(arr && arr.length){
+            const latest = arr[arr.length-1];
+            route = {
+              origin: airportCity(latest.estDepartureAirport),
+              dest:   airportCity(latest.estArrivalAirport),
+            };
+          }
+        }
+      } catch(e){}
     }
-    // Fallback: flights/aircraft endpoint
-    const now = Math.floor(Date.now()/1000);
-    const url2 = `https://opensky-network.org/api/flights/aircraft?icao24=${icao24}&begin=${now-10800}&end=${now}`;
-    const res2 = await fetch(url2);
-    if(!res2.ok) return null;
-    const arr = await res2.json();
-    if(!arr||!arr.length) return null;
-    const latest = arr[arr.length-1];
-    const route = {
-      origin: airportCity(latest.estDepartureAirport),
-      dest:   airportCity(latest.estArrivalAirport),
-    };
-    routeCache[icao24] = route;
+
+    if(route){ routeCache[icao24] = route; }
     return route;
   }catch(e){ return null; }
 }
@@ -1130,7 +1139,7 @@ async function fetchFlights(){
   status.textContent='● ABRUFEN...'; status.style.color='#888';
   try{
     const pad = Math.max(0.5, CFG.range/80);
-    const url = `https://opensky-network.org/api/states/all`+
+    const url = `${PROXY_URL}/flights`+
       `?lamin=${CFG.lat-pad}&lomin=${CFG.lon-pad}`+
       `&lamax=${CFG.lat+pad}&lomax=${CFG.lon+pad}`;
     const res = await fetch(url);
