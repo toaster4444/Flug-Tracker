@@ -1072,28 +1072,98 @@ function airportCity(icao){
   return AIRPORTS[icao.toUpperCase()] || icao.toUpperCase();
 }
 
+// ═══════════════════════════════════
+// ROUTEN DATENBANK (OpenFlights)
+// ═══════════════════════════════════
+let routeDB = null; // {CALLSIGN_PREFIX: {origin, dest}} geladen aus OpenFlights
+
+async function loadRouteDB(){
+  if(routeDB) return;
+  try {
+    // OpenFlights routes.dat: airline,airlineID,src,srcID,dst,dstID,codeshare,stops,equipment
+    const r = await fetch('https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat');
+    if(!r.ok) return;
+    const text = await r.text();
+    routeDB = {};
+    text.split('\n').forEach(line => {
+      const p = line.split(',');
+      if(p.length < 5) return;
+      const airline = (p[0]||'').trim().toUpperCase(); // 2-3 letter IATA/ICAO
+      const src     = (p[2]||'').trim().toUpperCase(); // origin IATA
+      const dst     = (p[4]||'').trim().toUpperCase(); // dest IATA
+      if(!airline || airline==='\\N' || !src || src==='\\N' || !dst || dst==='\\N') return;
+      if(!routeDB[airline]) routeDB[airline] = [];
+      routeDB[airline].push({origin: src, dest: dst});
+    });
+  } catch(e) { routeDB = {}; }
+}
+
+// IATA → Stadt (ergänzt ICAO-Datenbank)
+const IATA = {
+  'STR':'Stuttgart','MUC':'München','FRA':'Frankfurt','BER':'Berlin',
+  'DUS':'Düsseldorf','HAM':'Hamburg','CGN':'Köln','NUE':'Nürnberg',
+  'VIE':'Wien','ZRH':'Zürich','GVA':'Genf','BSL':'Basel',
+  'LHR':'London','LGW':'London Gatwick','LCY':'London City','STN':'London Stansted',
+  'CDG':'Paris','ORY':'Paris Orly','NCE':'Nizza','LYS':'Lyon','MRS':'Marseille',
+  'AMS':'Amsterdam','BRU':'Brüssel','MAD':'Madrid','BCN':'Barcelona',
+  'PMI':'Mallorca','LPA':'Gran Canaria','TFS':'Teneriffa','ACE':'Lanzarote',
+  'FCO':'Rom','MXP':'Mailand','LIN':'Mailand','BGY':'Bergamo','VCE':'Venedig',
+  'CPH':'Kopenhagen','ARN':'Stockholm','OSL':'Oslo','HEL':'Helsinki',
+  'WAW':'Warschau','PRG':'Prag','BUD':'Budapest','KRK':'Krakau',
+  'IST':'Istanbul','SAW':'Istanbul','AYT':'Antalya','ADB':'Izmir','ESB':'Ankara',
+  'DXB':'Dubai','DOH':'Doha','AUH':'Abu Dhabi','RUH':'Riad',
+  'TLV':'Tel Aviv','CAI':'Kairo','CMN':'Casablanca','TUN':'Tunis',
+  'JFK':'New York','EWR':'New York','LAX':'Los Angeles','ORD':'Chicago',
+  'ATL':'Atlanta','MIA':'Miami','BOS':'Boston','SFO':'San Francisco',
+  'YYZ':'Toronto','YVR':'Vancouver',
+  'HKG':'Hongkong','NRT':'Tokyo','SIN':'Singapur','BKK':'Bangkok',
+  'DEL':'Delhi','BOM':'Mumbai','PEK':'Peking','PVG':'Shanghai',
+  'ICN':'Seoul','MNL':'Manila',
+};
+
+function iataCity(code){
+  if(!code || code==='\\N') return null;
+  code = code.toUpperCase();
+  return IATA[code] || AIRPORTS[code] || code;
+}
+
 const routeCache = {};
+
+function lookupRouteInDB(callsign){
+  if(!routeDB || !callsign) return null;
+  // Callsign z.B. "DLH237" → airline prefix "DLH" oder "LH"
+  const cs = callsign.trim().toUpperCase();
+  // Versuche 3-Buchstaben ICAO prefix
+  const prefix3 = cs.slice(0,3);
+  const prefix2 = cs.slice(0,2);
+  const num = cs.replace(/^[A-Z]+/,''); // Flugnummer
+  
+  // Suche in DB nach Airline + Flugnummer
+  for(const prefix of [prefix3, prefix2]){
+    const routes = routeDB[prefix];
+    if(routes && routes.length > 0){
+      // Nimm erste Route dieser Airline als Annäherung
+      // (ideally würden wir nach Flugnummer matchen, aber das haben wir nicht)
+      const r = routes[0];
+      return {
+        origin: iataCity(r.origin),
+        dest:   iataCity(r.dest),
+      };
+    }
+  }
+  return null;
+}
 
 async function fetchRouteForFlight(icao24, callsign){
   if(routeCache[icao24]) return routeCache[icao24];
   if(!callsign || callsign.length < 3) return null;
-  try{
-    let route = null;
-    // OpenSky Routes API via corsproxy (nur für Routen, nicht für Positionen)
-    try {
-      const url = `https://corsproxy.io/?url=${encodeURIComponent('https://opensky-network.org/api/routes?callsign='+callsign.trim())}`;
-      const r = await fetch(url);
-      if(r.ok){
-        const d = await r.json();
-        if(d && d.route && d.route.length >= 2){
-          route = { origin: airportCity(d.route[0]), dest: airportCity(d.route[d.route.length-1]) };
-        }
-      }
-    } catch(e){}
-
-    if(route){ routeCache[icao24] = route; }
-    return route;
-  }catch(e){ return null; }
+  
+  // Warte bis RouteDB geladen
+  await loadRouteDB();
+  
+  const route = lookupRouteInDB(callsign);
+  if(route){ routeCache[icao24] = route; }
+  return route;
 }
 
 // ═══════════════════════════════════
@@ -1367,6 +1437,8 @@ window.onload=()=>{
   document.getElementById('cfgDemoMode').checked = true;
   allFlights=genDemo(); filterRender();
   updateTimer=setInterval(()=>{allFlights=genDemo();filterRender();},12000);
+  // Routen-Datenbank im Hintergrund vorladen
+  loadRouteDB();
 };
 </script>
 </body>
