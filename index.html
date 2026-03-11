@@ -1120,11 +1120,12 @@ async function fetchFlights(){
   status.textContent='● ABRUFEN...'; status.style.color='#888';
   try{
     // adsb.lol: /v2/lat/{lat}/lon/{lon}/dist/{nm}
-    // dist in nautical miles (1 km ≈ 0.54 nm)
-    const distNm = Math.round(CFG.range * 0.54 * 1.5);
-    const url = `${ADSBLOL}/lat/${CFG.lat}/lon/${CFG.lon}/dist/${distNm}`;
+    const distNm = Math.max(10, Math.round(CFG.range / 1.852));
+    const lat = CFG.lat.toFixed(4);
+    const lon = CFG.lon.toFixed(4);
+    const url = `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${distNm}`;
     const res = await fetch(url);
-    if(!res.ok) throw new Error('HTTP '+res.status);
+    if(!res.ok) throw new Error('HTTP '+res.status+' · '+url);
     const data = await res.json();
     const aircraft = data.ac || [];
 
