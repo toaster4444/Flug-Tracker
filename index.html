@@ -1077,24 +1077,38 @@ function airportCity(icao){
 // ═══════════════════════════════════
 let routeDB = null; // {CALLSIGN_PREFIX: {origin, dest}} geladen aus OpenFlights
 
+// ICAO Callsign Prefix → IATA Airline Code (für OpenFlights DB lookup)
+const ICAO_TO_IATA = {
+  'DLH':'LH','EWG':'EW','RYR':'FR','EZY':'U2','EJU':'U2','WZZ':'W6',
+  'THY':'TK','SWR':'LX','AUA':'OS','AFR':'AF','KLM':'KL','BAW':'BA',
+  'IBE':'IB','VLG':'VY','SAS':'SK','FIN':'AY','NAX':'DY','TAP':'TP',
+  'LOT':'LO','BTI':'BT','CSA':'OK','AEE':'A3','UAE':'EK','QTR':'QR',
+  'ETD':'EY','SVA':'SV','MSR':'MS','ETH':'ET','KQA':'KQ','DAL':'DL',
+  'UAL':'UA','AAL':'AA','ACA':'AC','SIA':'SQ','CPA':'CX','JAL':'JL',
+  'ANA':'NH','KAL':'KE','CSN':'CZ','CCA':'CA','THA':'TG','CFG':'DE',
+  'SXS':'XQ','BEL':'SN','TVF':'TO','TRA':'HV','EIN':'EI','RUK':'FR',
+  'ITY':'AZ','ROT':'RO','PGT':'PC','RAM':'AT','TUN':'TU',
+};
+
 async function loadRouteDB(){
   if(routeDB) return;
   try {
-    // OpenFlights routes.dat: airline,airlineID,src,srcID,dst,dstID,codeshare,stops,equipment
     const r = await fetch('https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat');
-    if(!r.ok) return;
+    if(!r.ok){ routeDB={}; return; }
     const text = await r.text();
     routeDB = {};
     text.split('\n').forEach(line => {
       const p = line.split(',');
       if(p.length < 5) return;
-      const airline = (p[0]||'').trim().toUpperCase(); // 2-3 letter IATA/ICAO
-      const src     = (p[2]||'').trim().toUpperCase(); // origin IATA
-      const dst     = (p[4]||'').trim().toUpperCase(); // dest IATA
-      if(!airline || airline==='\\N' || !src || src==='\\N' || !dst || dst==='\\N') return;
-      if(!routeDB[airline]) routeDB[airline] = [];
-      routeDB[airline].push({origin: src, dest: dst});
+      const airline = (p[0]||'').trim().toUpperCase();
+      const src     = (p[2]||'').trim().toUpperCase();
+      const dst     = (p[4]||'').trim().toUpperCase();
+      if(!airline || airline==='\\N' || src==='\\N' || dst==='\\N' || src.length!==3 || dst.length!==3) return;
+      if(!routeDB[airline]) routeDB[airline] = new Set();
+      routeDB[airline].add(src+'→'+dst);
     });
+    // Convert Sets to Arrays
+    Object.keys(routeDB).forEach(k => { routeDB[k] = [...routeDB[k]].map(s=>({origin:s.split('→')[0],dest:s.split('→')[1]})); });
   } catch(e) { routeDB = {}; }
 }
 
@@ -1131,24 +1145,20 @@ const routeCache = {};
 
 function lookupRouteInDB(callsign){
   if(!routeDB || !callsign) return null;
-  // Callsign z.B. "DLH237" → airline prefix "DLH" oder "LH"
-  const cs = callsign.trim().toUpperCase();
-  // Versuche 3-Buchstaben ICAO prefix
-  const prefix3 = cs.slice(0,3);
-  const prefix2 = cs.slice(0,2);
-  const num = cs.replace(/^[A-Z]+/,''); // Flugnummer
-  
-  // Suche in DB nach Airline + Flugnummer
-  for(const prefix of [prefix3, prefix2]){
-    const routes = routeDB[prefix];
+  const cs      = callsign.trim().toUpperCase();
+  const icao3   = cs.slice(0,3);
+  const icao2   = cs.slice(0,2);
+  const iata3   = ICAO_TO_IATA[icao3] || icao3;
+  const iata2   = ICAO_TO_IATA[icao2] || icao2;
+
+  // Suche mit IATA Code (wie in OpenFlights gespeichert), dann ICAO als Fallback
+  for(const code of [iata3, iata2, icao3, icao2]){
+    const routes = routeDB[code];
     if(routes && routes.length > 0){
-      // Nimm erste Route dieser Airline als Annäherung
-      // (ideally würden wir nach Flugnummer matchen, aber das haben wir nicht)
-      const r = routes[0];
-      return {
-        origin: iataCity(r.origin),
-        dest:   iataCity(r.dest),
-      };
+      // Bevorzuge Routen von/nach Stuttgart oder Süddeutschland
+      const local = routes.find(r => r.origin==='STR'||r.dest==='STR'||r.origin==='MUC'||r.dest==='MUC'||r.origin==='FRA'||r.dest==='FRA');
+      const r = local || routes[Math.floor(routes.length/2)];
+      return { origin: iataCity(r.origin), dest: iataCity(r.dest) };
     }
   }
   return null;
